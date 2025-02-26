@@ -15,7 +15,7 @@
 //    - Static checks for JSON-serializable argument types  
 //    - Example: Reject `void func(int&)` if `int&` can't be deserialized  
 //  
-// 4. Handle duplicate command names  
+// 4. Handle duplicate command names (+)
 //    - Add `overwrite` flag to register_command()  
 //    - Throw error/warning if a command already exists (configurable behavior)  
 // 
@@ -42,25 +42,43 @@
 #   define flev_cdecl 
 #endif
 
+
+/**
+ * @brief Macro to get the cleaned name of a function/method.
+ * @param func Function or method.
+ * @return String without class/namespace prefixes.
+ */
+#define GET_FUNC_NAME(func) flev::functional::remove_class_prefix(#func)
+
+namespace flev {
+
+enum class Duplicate_policy
+{
+    Throw,
+    Skip,
+    Replace
+};
+
+namespace functional {
 /**
  * @brief Removes class/namespace prefixes and reference symbols from a type name string.
  * @param str Input string (e.g., "&MyClass::method").
  * @return Cleaned name without prefixes (e.g., "method").
  */
-constexpr const char* remove_class_prefix(const char* str) 
+constexpr const char* remove_class_prefix(const char* str)
 {
     const char* result = str;
     // Skip leading '&' if present
-    if (result[0] == '&') 
+    if (result[0] == '&')
     {
         ++result;
     }
     const char* last_colons = nullptr;
 #ifdef FLEV_SKIP_CLASS_NAME
     // Find last occurrence of "::"
-    for (const char* p = result; *p != '\0'; ++p) 
+    for (const char* p = result; *p != '\0'; ++p)
     {
-        if (p[0] == ':' && p[1] == ':') 
+        if (p[0] == ':' && p[1] == ':')
         {
             last_colons = p;
             ++p; // Skip second colon
@@ -71,21 +89,12 @@ constexpr const char* remove_class_prefix(const char* str)
 }
 
 /**
- * @brief Macro to get the cleaned name of a function/method.
- * @param func Function or method.
- * @return String without class/namespace prefixes.
- */
-#define GET_FUNC_NAME(func) remove_class_prefix(#func)
-
-namespace flev {
-namespace functional {
-
-/**
  * @brief Traits class to detect if a lambda captures context.
  * @tparam T Type to check (lambda, function, etc.).
  */
 template <typename T>
-struct has_capture_t {
+struct has_capture_t 
+{
 private:
     template <typename U>
     static constexpr bool is_function_or_member_ptr_v =
@@ -194,11 +203,40 @@ using namespace functional;
  * @brief Thread-safe JSON-RPC command handler.
  * @details Supports registration of free functions, class methods, and stateless lambdas.
  */
-class T_Command_handler
+class Command_handler
 {
-    using command_function = std::function<nlohmann::json(const nlohmann::json&)>; ///< Command function type.
+    // =============================================
+    // Construction control (Singleton pattern)
+    // =============================================
 
-    /// @brief Internal command entry structure.
+    Command_handler() = default;
+    ~Command_handler() = default;
+    Command_handler(const Command_handler&) = delete;
+    Command_handler& operator=(const Command_handler&) = delete;
+    Command_handler(Command_handler&&) = delete;
+    Command_handler& operator=(Command_handler&&) = delete;
+
+public:
+
+    /**
+     * @brief Returns the singleton instance (thread-safe initialization).
+     */
+    static Command_handler& instance() noexcept 
+    {
+        static Command_handler handler;
+        return handler;
+    }
+
+private:
+    // =============================================
+    // Internal types
+    // =============================================
+
+    using command_function = std::function<nlohmann::json(const nlohmann::json&)>; 
+
+    /**
+     * @brief Internal command entry with object lifetime tracking for methods.
+     */
     struct Command
     {
         std::weak_ptr<void> weak_obj; ///< Weak pointer to bound object (for methods).
@@ -206,17 +244,22 @@ class T_Command_handler
         bool is_method = false;       ///< True if the command is a method.
     };
 
-    std::map<std::string, Command> commands; ///< Registered commands.
-    mutable std::shared_mutex M_commands;    ///< Mutex for thread safety.
+    // =============================================
+    // Data members
+    // =============================================
+    std::map<std::string, Command> commands; ///< Registered commands
+    mutable std::shared_mutex M_commands;    ///< Mutex for thread safety
+
+    Duplicate_policy duplicate_policy = Duplicate_policy::Throw; ///< Current duplicate policy
+
+    // =============================================
+    // Command processing internals
+    // =============================================
 
     /**
-     * @brief Creates a command function wrapper for JSON processing.
-     * @tparam Is_method True if the command is a class method.
-     * @tparam Func Function/method type.
-     * @tparam WeakObj Weak pointer type (for methods).
-     * @param func Function/method pointer.
-     * @param weak_obj Weak pointer to the bound object.
-     * @return Command function wrapper.
+     * @brief Creates a JSON-processing wrapper for a function/method.
+     * @tparam Is_method True for class methods
+     * @details Performs argument count validation and type conversion.
      */
     template <bool Is_method, typename Func, typename Weak_obj>
     auto make_command_function(Func func, Weak_obj weak_obj)
@@ -289,26 +332,75 @@ class T_Command_handler
     }
 
     /**
-     * @brief Internal command registration implementation.
-     * @tparam Is_method True for class methods.
-     * @tparam Func Function/method type.
-     * @tparam WeakObj Weak pointer type.
-     * @param name Command name.
-     * @param func Function/method pointer.
-     * @param weak_obj Weak pointer to the bound object.
+     * @brief Internal command registration with duplicate policy handling.
+     * @throws std::runtime_error if policy is Throw and command exists
      */
     template <bool Is_method, typename Func, typename WeakObj>
-    void register_command_impl(const std::string& name, Func func, WeakObj weak_obj) noexcept
+    void register_command_impl(const std::string& name, Func func, WeakObj weak_obj)
     {
         std::unique_lock lock(M_commands);
 
         using Return_type = typename Function_traits<decltype(func)>::return_type;
         static_assert(can_be_serialized<Return_type> || std::is_void_v<Return_type>,
             "Return type must be convertible to nlohmann::json");
-        commands[name] = { weak_obj, make_command_function<Is_method>(func, weak_obj), Is_method };
+
+        // Handle duplicates according to policy
+        if (commands.contains(name))
+        {
+            switch (duplicate_policy)
+            {
+            case Duplicate_policy::Replace:
+                commands.erase(name);
+                break;
+            case Duplicate_policy::Skip :
+                return;
+            case Duplicate_policy::Throw :
+            default:
+                throw std::runtime_error("Command with " + name + " already exists");
+            }
+        }
+        commands[name] = { weak_obj, 
+                           make_command_function<Is_method>(func, weak_obj), 
+                           Is_method 
+        };
     }
 
 public:
+
+    // =============================================
+    // Public API
+    // =============================================
+
+    /**
+     * @brief Checks if a command is registered.
+     * @param name Command name to check
+     * @returns True if command exists (thread-safe)
+     */
+    bool command_exists(const std::string& name) const noexcept
+    {
+        std::shared_lock lock(M_commands);
+        return commands.contains(name);
+    }
+
+    /**
+     * @brief Sets policy for handling duplicate commands.
+     * @param new_policy Policy to apply (Throw/Skip/Replace)
+     */
+    void set_duplicate_policy(Duplicate_policy new_policy) noexcept
+    {
+        std::unique_lock lock(M_commands);
+        duplicate_policy = new_policy;
+    }
+
+    /**
+     * @returns current duplicate policy.
+     */
+    Duplicate_policy get_duplicate_policy() const noexcept
+    {
+        std::shared_lock lock(M_commands);
+        return duplicate_policy;
+    }
+
     /**
      * @brief Registers a free function or stateless lambda as a command.
      * @tparam Func Function type.
@@ -317,7 +409,7 @@ public:
      * @throws static_assert if Func is a lambda with captures.
      */
     template <typename Func>
-    void register_command(const std::string& name, Func func) noexcept
+    void register_command(const std::string& name, Func func)
     {
         static_assert(
             !has_capture<Func>,
@@ -335,7 +427,7 @@ public:
      * @param obj Shared pointer to the bound object.
      */
     template <typename Func, typename Obj>
-    void register_command(const std::string& name, Func func, std::shared_ptr<Obj> obj) noexcept
+    void register_command(const std::string& name, Func func, std::shared_ptr<Obj> obj)
     {
         register_command_impl<true>(name, func, std::weak_ptr<Obj>(obj));
     }
@@ -422,7 +514,4 @@ public:
         return response;
     }
 };
-
-/// @brief Global instance of the command handler.
-static T_Command_handler Command_handler;
 } // namespace flev
