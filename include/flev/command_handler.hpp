@@ -11,7 +11,7 @@
 // 2. Add asynchronous command execution  
 //    - Support thread pools or std::async for long-running operations  
 //  
-// 3. Validate function arguments during registration  
+// 3. Validate function arguments during registration (+)
 //    - Static checks for JSON-serializable argument types  
 //    - Example: Reject `void func(int&)` if `int&` can't be deserialized  
 //  
@@ -86,6 +86,31 @@ constexpr const char* remove_class_prefix(const char* str)
     }
 #endif
     return last_colons ? (last_colons + 2) : result;
+}
+
+/**
+* @brief Checks if a type can be deserialized from nlohmann::json.
+* @tparam T Type to check.
+*/
+template <typename T, typename = void>
+inline constexpr bool can_be_deserialized = false;
+
+template <typename T>
+inline constexpr bool can_be_deserialized<T,
+    std::void_t<decltype(std::declval<const nlohmann::json&>().get<T>())>> = true;
+
+template <typename Tuple, size_t... I>
+constexpr bool all_args_deserializable(std::index_sequence<I...>) 
+{
+    return (can_be_deserialized<std::tuple_element_t<I, Tuple>> && ...);
+}
+
+template <typename Tuple>
+constexpr bool all_args_deserializable() 
+{
+    return all_args_deserializable<Tuple>(
+        std::make_index_sequence<std::tuple_size_v<Tuple>>{}
+    );
 }
 
 /**
@@ -335,14 +360,22 @@ private:
      * @brief Internal command registration with duplicate policy handling.
      * @throws std::runtime_error if policy is Throw and command exists
      */
-    template <bool Is_method, typename Func, typename WeakObj>
-    void register_command_impl(const std::string& name, Func func, WeakObj weak_obj)
+    template <bool Is_method, typename Func, typename Weak_obj>
+    void register_command_impl(const std::string& name, Func func, Weak_obj weak_obj)
     {
         std::unique_lock lock(M_commands);
 
-        using Return_type = typename Function_traits<decltype(func)>::return_type;
+        using Traits = Function_traits<decltype(func)>;
+        using Args_tuple = typename Traits::args_tuple;
+        using Return_type = typename Traits::return_type;
+
         static_assert(can_be_serialized<Return_type> || std::is_void_v<Return_type>,
             "Return type must be convertible to nlohmann::json");
+        static_assert(all_args_deserializable<Args_tuple>(), 
+            "All function arguments must be deserializable from nlohmann::json. "
+            "Ensure that:\n"
+            "1) Argument types are supported by nlohmann::json (e.g., int, std::string).\n"
+            "2) Custom types have `adl_serializer` specialization.\n");
 
         // Handle duplicates according to policy
         if (commands.contains(name))
@@ -355,8 +388,9 @@ private:
             case Duplicate_policy::Skip :
                 return;
             case Duplicate_policy::Throw :
-            default:
                 throw std::runtime_error("Command with " + name + " already exists");
+            default:
+                throw std::runtime_error("Invalid duplicate policy");
             }
         }
         commands[name] = { weak_obj, 
