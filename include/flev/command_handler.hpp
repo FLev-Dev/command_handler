@@ -171,7 +171,7 @@ template <typename Ret, typename... Args>
 struct Function_traits<Ret(flev_cdecl*)(Args...)>
 {
     using args_tuple = std::tuple<std::decay_t<Args>...>; ///< Tuple of decayed argument types.
-    using return_type = Ret; ///< Return type.
+    using return_type = Ret;                              ///< Return type.
     static constexpr size_t args_count = sizeof...(Args); ///< Number of arguments.
 };
 
@@ -332,7 +332,7 @@ private:
                 }
                 return nlohmann::json();
             }
-            else
+            else // return type not a void
             {
                 if constexpr (Is_method)
                 {
