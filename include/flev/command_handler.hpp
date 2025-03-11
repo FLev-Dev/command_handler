@@ -4,7 +4,7 @@
 #include <nlohmann/json.hpp>
 
 // TODO: Expand command handler functionality  
-// 1. Implement middleware support  
+// 1. Implement middleware support (+) 
 //    - Add pre/post-execution hooks for logging, auth, validation, etc.  
 //    - Example: Allow users to chain middleware like `Command_handler.add_auth_middleware(...)`  
 //  
@@ -34,6 +34,7 @@
 
 /**
  * @brief Platform-specific calling convention macro.
+ * 
  * @details Uses __cdecl on MSVC compilers, empty otherwise.
  */
 #ifdef _MSC_VER
@@ -45,10 +46,12 @@
 
 /**
  * @brief Macro to get the cleaned name of a function/method.
- * @param func Function or method.
- * @return String without class/namespace prefixes.
+ * 
+ * @param func[in] - Function or method.
+ * 
+ * @returns String without class/namespace prefixes.
  */
-#define GET_FUNC_NAME(func) flev::functional::remove_class_prefix(#func)
+#define GET_FUNC_NAME(func) flev::detail::remove_class_prefix(#func)
 
 namespace flev {
 
@@ -59,11 +62,25 @@ enum class Duplicate_policy
     Replace
 };
 
-namespace functional {
+/**
+ * @brief Execution context shared between middleware and commands.
+ */
+struct Execution_context
+{
+    nlohmann::json request;
+    nlohmann::json response;
+    /// @brief User-defined storage for passing data between middleware.
+    std::unordered_map<std::string, std::any> storage;
+};
+
+namespace detail {
+
 /**
  * @brief Removes class/namespace prefixes and reference symbols from a type name string.
- * @param str Input string (e.g., "&MyClass::method").
- * @return Cleaned name without prefixes (e.g., "method").
+ * 
+ * @param str[in] - Input string (e.g., "&MyClass::method").
+ * 
+ * @returns Cleaned name without prefixes (e.g., "method").
  */
 constexpr const char* remove_class_prefix(const char* str)
 {
@@ -90,7 +107,8 @@ constexpr const char* remove_class_prefix(const char* str)
 
 /**
 * @brief Checks if a type can be deserialized from nlohmann::json.
-* @tparam T Type to check.
+* 
+* @tparam T - Type to check.
 */
 template <typename T, typename = void>
 inline constexpr bool can_be_deserialized = false;
@@ -115,7 +133,8 @@ constexpr bool all_args_deserializable()
 
 /**
  * @brief Traits class to detect if a lambda captures context.
- * @tparam T Type to check (lambda, function, etc.).
+ * 
+ * @tparam T - Type to check (lambda, function, etc.).
  */
 template <typename T>
 struct has_capture_t 
@@ -145,7 +164,8 @@ inline constexpr bool has_capture = has_capture_t<T>::value;
 
 /**
  * @brief Checks if a type can be serialized to nlohmann::json.
- * @tparam T Type to check.
+ * 
+ * @tparam T - Type to check.
  */
 template <typename T, typename = void>
 inline constexpr bool can_be_serialized = false;
@@ -157,7 +177,8 @@ inline constexpr bool can_be_serialized<T,
 
 /**
  * @brief Traits class to extract function/method signature details.
- * @tparam Func Function, method, or lambda type.
+ * 
+ * @tparam Func - Function, method, or lambda type.
  */
 template <typename Func>
 struct Function_traits;
@@ -220,12 +241,13 @@ struct Function_traits<Ret(flev_cdecl C::*)(Args...) const noexcept>
     static constexpr size_t args_count = sizeof...(Args);
 };
 
-} // namespace functional
+} // namespace detail
 
-using namespace functional;
+using namespace detail;
 
 /**
  * @brief Thread-safe JSON-RPC command handler.
+ * 
  * @details Supports registration of free functions, class methods, and stateless lambdas.
  */
 class Command_handler
@@ -258,6 +280,16 @@ private:
     // =============================================
 
     using command_function = std::function<nlohmann::json(const nlohmann::json&)>; 
+    using middleware_function = std::function<void(Execution_context&)>;
+
+    /**
+     * @brief Internal middleware entry with priority.
+     */
+    struct Middleware_entry 
+    {
+        int priority;              ///< Execution order (lower = earlier)
+        middleware_function func;  ///< Middleware function
+    };
 
     /**
      * @brief Internal command entry with object lifetime tracking for methods.
@@ -275,6 +307,10 @@ private:
     std::map<std::string, Command> commands; ///< Registered commands
     mutable std::shared_mutex M_commands;    ///< Mutex for thread safety
 
+    std::vector<Middleware_entry> pre_middlewares; ///< Pre-processing middleware chain
+    std::vector<Middleware_entry> post_middlewares;///< Post-processing middleware chain
+    mutable std::shared_mutex M_middlewares;       ///< Mutex for thread safety 
+
     Duplicate_policy duplicate_policy = Duplicate_policy::Throw; ///< Current duplicate policy
 
     // =============================================
@@ -283,7 +319,9 @@ private:
 
     /**
      * @brief Creates a JSON-processing wrapper for a function/method.
-     * @tparam Is_method True for class methods
+     * 
+     * @tparam Is_method - True for class methods
+     * 
      * @details Performs argument count validation and type conversion.
      */
     template <bool Is_method, typename Func, typename Weak_obj>
@@ -358,6 +396,7 @@ private:
 
     /**
      * @brief Internal command registration with duplicate policy handling.
+     * 
      * @throws std::runtime_error if policy is Throw and command exists
      */
     template <bool Is_method, typename Func, typename Weak_obj>
@@ -370,7 +409,8 @@ private:
         using Return_type = typename Traits::return_type;
 
         static_assert(can_be_serialized<Return_type> || std::is_void_v<Return_type>,
-            "Return type must be convertible to nlohmann::json");
+            "Return type must be serializable to JSON. "
+            "For custom types, specialize nlohmann::adl_serializer.");
         static_assert(all_args_deserializable<Args_tuple>(), 
             "All function arguments must be deserializable from nlohmann::json. "
             "Ensure that:\n"
@@ -407,7 +447,9 @@ public:
 
     /**
      * @brief Checks if a command is registered.
-     * @param name Command name to check
+     * 
+     * @param name[in] - Command name to check
+     * 
      * @returns True if command exists (thread-safe)
      */
     bool command_exists(const std::string& name) const noexcept
@@ -417,29 +459,13 @@ public:
     }
 
     /**
-     * @brief Sets policy for handling duplicate commands.
-     * @param new_policy Policy to apply (Throw/Skip/Replace)
-     */
-    void set_duplicate_policy(Duplicate_policy new_policy) noexcept
-    {
-        std::unique_lock lock(M_commands);
-        duplicate_policy = new_policy;
-    }
-
-    /**
-     * @returns current duplicate policy.
-     */
-    Duplicate_policy get_duplicate_policy() const noexcept
-    {
-        std::shared_lock lock(M_commands);
-        return duplicate_policy;
-    }
-
-    /**
      * @brief Registers a free function or stateless lambda as a command.
-     * @tparam Func Function type.
-     * @param name Command name.
-     * @param func Function pointer or lambda.
+     * 
+     * @tparam Func - Function type.
+     * 
+     * @param name[in] - Command name.
+     * @param func[in] - Function pointer or lambda.
+     * 
      * @throws static_assert if Func is a lambda with captures.
      */
     template <typename Func>
@@ -454,11 +480,13 @@ public:
 
     /**
      * @brief Registers a class method as a command.
-     * @tparam Func Method type.
-     * @tparam Obj Class type.
-     * @param name Command name.
-     * @param func Method pointer.
-     * @param obj Shared pointer to the bound object.
+     * 
+     * @tparam Func - Method type.
+     * @tparam Obj - Class type.
+     * 
+     * @param name[in] - Command name.
+     * @param func[in] - Method pointer.
+     * @param obj[in]  - Shared pointer to the bound object.
      */
     template <typename Func, typename Obj>
     void register_command(const std::string& name, Func func, std::shared_ptr<Obj> obj)
@@ -468,7 +496,8 @@ public:
 
     /**
      * @brief Unregisters a command by name.
-     * @param name Command name to remove.
+     * 
+     * @param name[in] - Command name to remove.
      */
     void unregister_command(const std::string& name) noexcept
     {
@@ -478,74 +507,157 @@ public:
 
     /**
      * @brief Executes a JSON-RPC request.
-     * @param request_str JSON input string.
-     * @return JSON response with status, result, or error message.
+     * 
+     * @param request_str[in] - JSON input string.
+     * 
+     * @returns JSON response with status, result, or error message.
      */
     nlohmann::json execute(const std::string& request_str) const noexcept
     {
+        Execution_context context; // Stores request/response data and middleware state
         nlohmann::json response;
-        nlohmann::json request;
-
-        if (!nlohmann::json::accept(request_str))
-        {
-            response["status"] = "error";
-            response["message"] = "Invalid json format";
-            return response;
-        }
-        request = nlohmann::json::parse(request_str);
-
-        if (request.contains("id"))
-        {
-            response["id"] = request["id"];
-        }
-
-        //get function name from entry json
-        if (!request.contains("command"))
-        {
-            response["status"] = "error";
-            response["message"] = "Missing 'command' field";
-            return response;
-        }
-        if (!request["command"].is_string())
-        {
-            response["status"] = "error";
-            response["message"] = "'command' field not a string";
-            return response;
-        }
-        const std::string command_name = request["command"];
 
         try
         {
-            nlohmann::json args = request.value("data", nlohmann::json::array());
+            // Parse JSON input (throws nlohmann::json::parse_error on failure)
+            context.request = nlohmann::json::parse(request_str);
+
+            // Validate mandatory fields
+            if (!context.request.contains("command"))
+            {
+                throw std::invalid_argument("Missing 'command' field");
+            }
+            if (!context.request["command"].is_string())
+            {
+                throw std::invalid_argument("'command' field must be a string");
+            }
+
+            // Copy request ID to response (if provided)
+            if (context.request.contains("id"))
+            {
+                context.response["id"] = context.request["id"];
+            }
+
+            // Execute pre-middleware chain (e.g., auth, logging)
+            {
+                std::shared_lock lock(M_middlewares);
+                for (const auto& middleware : pre_middlewares)
+                {
+                    middleware.func(context);  // Pass context to each middleware
+                }
+            }
+
+            // Extract command name and arguments
+            const std::string command_name = context.request["command"];
+            const auto& args = context.request.value("data", nlohmann::json::array());
+
+            // Validate arguments format
             if (!args.is_array())
             {
-                throw std::invalid_argument("Field 'data' must be an array");
+                throw std::invalid_argument("'data' field must be a JSON array");
             }
 
-            //safety get function from commands
+            // Find registered command
             std::shared_lock lock(M_commands);
-            auto it = commands.find(command_name);
-            if (it == commands.end())
+            auto command_it = commands.find(command_name);
+            if (command_it == commands.end())
             {
-                response["status"] = "error";
-                response["message"] = "Unknown command: " + command_name;
-                return response;
+                throw std::runtime_error("Unknown command: " + command_name);
             }
-            auto command = it->second; //copy for thread safe
+            auto command = command_it->second;  // Copy command for thread safety
             lock.unlock();
 
-            if (nlohmann::json result = command.function(args); !result.is_null())
+            // Execute command and store result
+            context.response = command.function(args);
+            context.response["status"] = "ok";  // Default success status
+
+            // Execute post-middleware chain (e.g., add metadata)
             {
-                response["result"] = std::move(result);
+                std::shared_lock lock(M_middlewares);
+                for (const auto& middleware : post_middlewares)
+                {
+                    middleware.func(context);  // Modify response if needed
+                }
             }
-            response["status"] = "ok";
+        }
+        catch (const nlohmann::json::parse_error& ex)
+        {
+            // Handle JSON parsing errors
+            context.response["status"] = "error";
+            context.response["message"] = "Invalid JSON: " + std::string(ex.what());
         }
         catch (const std::exception& ex)
         {
-            response["status"] = "error";
-            response["message"] = std::string("Command execution failed: ") + ex.what();
+            // Handle all other exceptions
+            context.response["status"] = "error";
+            context.response["message"] = "Error: " + std::string(ex.what());
         }
-        return response;
+        catch (...) 
+        {
+            context.response["status"] = "error";
+            context.response["message"] = "Unknown error";
+        }
+        return context.response;
+    }
+
+    // =============================================
+    //  Duplicate Policy API
+    // =============================================
+
+    /**
+     * @brief Sets policy for handling duplicate commands.
+     * 
+     * @param new_policy[in] - Policy to apply (Throw/Skip/Replace)
+     */
+    void set_duplicate_policy(const Duplicate_policy new_policy) noexcept
+    {
+        std::unique_lock lock(M_commands);
+        duplicate_policy = new_policy;
+    }
+
+    /**
+     * @returns Current duplicate policy.
+     */
+    Duplicate_policy get_duplicate_policy() const noexcept
+    {
+        std::shared_lock lock(M_commands);
+        return duplicate_policy;
+    }
+
+    // =============================================
+    //  Middleware Registration API
+    // =============================================
+
+    /**
+     * @brief Adds a pre-middleware with optional priority.
+     * 
+     * @param func[in] - Middleware function
+     * @param priority[in][opt] - Execution order (lower = earlier). Default: 0.
+     */
+    void add_pre_middleware(std::function<void(Execution_context&)> func, int priority = 0)
+    {
+        std::unique_lock lock(M_middlewares);
+        pre_middlewares.push_back({ priority, std::move(func) });
+
+        // Sort by priority (ascending)
+        std::stable_sort(pre_middlewares.begin(), pre_middlewares.end(),
+            [](const auto& a, const auto& b) { return a.priority < b.priority; });
+    }
+
+    /**
+     * @brief Adds a post-middleware with optional priority.
+     * 
+     * @param func[in] - Middleware function
+     * @param priority[in][opt] - Execution order (lower = earlier). Default: 0.
+     */
+    void add_post_middleware(std::function<void(Execution_context&)> func, int priority = 0)
+    {
+        std::unique_lock lock(M_middlewares);
+        post_middlewares.push_back({ priority, std::move(func) });
+
+        // Sort by priority (ascending)
+        std::stable_sort(post_middlewares.begin(), post_middlewares.end(),
+            [](const auto& a, const auto& b) { return a.priority < b.priority; });
     }
 };
 } // namespace flev
