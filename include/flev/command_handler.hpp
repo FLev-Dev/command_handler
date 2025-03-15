@@ -568,7 +568,11 @@ public:
             lock.unlock();
 
             // Execute command and store result
-            context.response = command.function(args);
+            auto result = command.function(args);
+            if (!result.is_null())
+            {
+                context.response["result"] = result;
+            }
             context.response["status"] = "ok";  // Default success status
 
             // Execute post-middleware chain (e.g., add metadata)
@@ -645,6 +649,15 @@ public:
     }
 
     /**
+     * @brief Clears all registered pre-middlewares.
+     */
+    void clear_pre_middlewares() noexcept
+    {
+        std::unique_lock lock(M_middlewares);
+        pre_middlewares.clear();
+    }
+
+    /**
      * @brief Adds a post-middleware with optional priority.
      * 
      * @param func[in] - Middleware function
@@ -658,6 +671,15 @@ public:
         // Sort by priority (ascending)
         std::stable_sort(post_middlewares.begin(), post_middlewares.end(),
             [](const auto& a, const auto& b) { return a.priority < b.priority; });
+    }
+
+    /**
+     * @brief Clears all registered post-middlewares.
+     */
+    void clear_post_middlewares() noexcept
+    {
+        std::unique_lock lock(M_middlewares);
+        post_middlewares.clear();
     }
 };
 } // namespace flev
