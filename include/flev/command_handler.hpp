@@ -14,15 +14,17 @@
 #   define flev_cdecl 
 #endif
 
+#ifndef GET_FUNC_NAME
+  /**
+   * @brief Macro to get the cleaned name of a function/method.
+   *
+   * @param func[in] - Function or method.
+   *
+   * @returns String without class/namespace prefixes.
+   */
+#   define GET_FUNC_NAME(func) flev::detail::remove_class_prefix(#func)
+#endif // !GET_FUNC_NAME
 
-/**
- * @brief Macro to get the cleaned name of a function/method.
- * 
- * @param func[in] - Function or method.
- * 
- * @returns String without class/namespace prefixes.
- */
-#define GET_FUNC_NAME(func) flev::detail::remove_class_prefix(#func)
 
 namespace flev {
 
