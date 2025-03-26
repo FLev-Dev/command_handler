@@ -3,35 +3,6 @@
 #include <shared_mutex>
 #include <nlohmann/json.hpp>
 
-// TODO: Expand command handler functionality  
-// 1. Implement middleware support (+) 
-//    - Add pre/post-execution hooks for logging, auth, validation, etc.  
-//    - Example: Allow users to chain middleware like `Command_handler.add_auth_middleware(...)`  
-//  
-// 2. Add asynchronous command execution  
-//    - Support thread pools or std::async for long-running operations  
-//  
-// 3. Validate function arguments during registration (+)
-//    - Static checks for JSON-serializable argument types  
-//    - Example: Reject `void func(int&)` if `int&` can't be deserialized  
-//  
-// 4. Handle duplicate command names (+)
-//    - Add `overwrite` flag to register_command()  
-//    - Throw error/warning if a command already exists (configurable behavior)  
-// 
-// 5. Custom error handling and diagnostics  
-//    - Allow users to register custom exception handlers (e.g., map exceptions to JSON error codes).  
-//    - Add optional error codes (e.g., "error_429: Too Many Requests") and stack traces for debugging.  
-//  
-// 6. Rate limiting and call quotas  
-//    - Implement per-command or per-user call limits (e.g., 100 requests/minute).  
-//    - Integrate with middleware to reject early (return JSON error 429).  
-//  
-// 7. Optimize JSON parsing/validation  (Opt)
-//    - Replace nlohmann::json with simdjson for faster parsing (or add optional SIMD support).  
-//    - Pre-validate JSON structure during registration to reduce runtime overhead. 
-
-
 /**
  * @brief Platform-specific calling convention macro.
  * 
@@ -60,6 +31,15 @@ enum class Duplicate_policy
     Throw,
     Skip,
     Replace
+};
+
+enum class Log_level
+{
+    Debug,
+    Info,
+    Warning,
+    Error,
+    Critical
 };
 
 /**
@@ -281,7 +261,7 @@ private:
 
     using command_function = std::function<nlohmann::json(const nlohmann::json&)>; 
     using middleware_function = std::function<void(Execution_context&)>;
-
+    using log_function = std::function<void(const std::string&, Log_level)>;
     /**
      * @brief Internal middleware entry with priority.
      */
@@ -313,9 +293,35 @@ private:
 
     Duplicate_policy duplicate_policy = Duplicate_policy::Throw; ///< Current duplicate policy
 
+    log_function logger;                                 ///< User-provided logger
+    mutable std::shared_mutex M_logger;                  ///< Mutex for thread-safe logger access
+    std::atomic<Log_level> log_level = Log_level::Debug;
+
     // =============================================
     // Command processing internals
     // =============================================
+
+    /**
+     * @brief Internal logging method with level check
+     */
+    void log(const std::string& message, Log_level level) const noexcept
+    {
+        if (level < log_level.load(std::memory_order_acquire))
+        {
+            return;
+        }
+
+        std::shared_lock lock(M_logger);
+        if (logger) 
+        {
+            try {
+                logger(message, level);
+            }
+            catch (...) {
+                // Prevent exceptions from propagating
+            }
+        }
+    }
 
     /**
      * @brief Creates a JSON-processing wrapper for a function/method.
@@ -420,16 +426,22 @@ private:
         // Handle duplicates according to policy
         if (commands.contains(name))
         {
+            log("Command '" + name + "' already exists", Log_level::Debug);
             switch (duplicate_policy)
             {
             case Duplicate_policy::Replace:
                 commands.erase(name);
+                log("Replacing existing command: " + name, Log_level::Warning);
                 break;
             case Duplicate_policy::Skip :
+                log("Skipping duplicate command: " + name, Log_level::Info);
                 return;
             case Duplicate_policy::Throw :
+                log("Duplicate command registration attempted: " + name, Log_level::Error);
                 throw std::runtime_error("Command with " + name + " already exists");
             default:
+                log("Invalid duplicate policy: " +
+                    std::to_string(static_cast<int>(duplicate_policy)), Log_level::Critical);
                 throw std::runtime_error("Invalid duplicate policy");
             }
         }
@@ -437,6 +449,11 @@ private:
                            make_command_function<Is_method>(func, weak_obj), 
                            Is_method 
         };
+
+        log("Command '" + name + "' registered successfully. "
+            "Arguments: " + std::to_string(Traits::args_count) + ", "
+            "Return type: " + typeid(Return_type).name(),
+            Log_level::Info);
     }
 
 public:
@@ -503,6 +520,7 @@ public:
     {
         std::unique_lock lock(M_commands);
         commands.erase(name);
+        log("Unregistered command: " + name, Log_level::Info);
     }
 
     /**
@@ -516,6 +534,8 @@ public:
     {
         Execution_context context; // Stores request/response data and middleware state
         nlohmann::json response;
+
+        log("Processing request: " + request_str, Log_level::Debug);
 
         try
         {
@@ -541,6 +561,9 @@ public:
             // Execute pre-middleware chain (e.g., auth, logging)
             {
                 std::shared_lock lock(M_middlewares);
+                log("Processing pre-middleware chain (" +
+                    std::to_string(pre_middlewares.size()) + " items)",
+                    Log_level::Debug);
                 for (const auto& middleware : pre_middlewares)
                 {
                     middleware.func(context);  // Pass context to each middleware
@@ -578,6 +601,9 @@ public:
             // Execute post-middleware chain (e.g., add metadata)
             {
                 std::shared_lock lock(M_middlewares);
+                log("Processing post-middleware chain (" +
+                    std::to_string(post_middlewares.size()) + " items)",
+                    Log_level::Debug);
                 for (const auto& middleware : post_middlewares)
                 {
                     middleware.func(context);  // Modify response if needed
@@ -589,17 +615,20 @@ public:
             // Handle JSON parsing errors
             context.response["status"] = "error";
             context.response["message"] = "Invalid JSON: " + std::string(ex.what());
+            log("JSON parse error: " + std::string(ex.what()), Log_level::Error);
         }
         catch (const std::exception& ex)
         {
             // Handle all other exceptions
             context.response["status"] = "error";
             context.response["message"] = "Error: " + std::string(ex.what());
+            log("Execution error: " + std::string(ex.what()), Log_level::Error);
         }
         catch (...) 
         {
             context.response["status"] = "error";
             context.response["message"] = "Unknown error";
+            log("Unknown error occurred", Log_level::Critical);
         }
         return context.response;
     }
@@ -637,8 +666,11 @@ public:
      * 
      * @param func[in] - Middleware function
      * @param priority[in][opt] - Execution order (lower = earlier). Default: 0.
+     * 
+     * @note If middleware has the same priority, 
+     *   they will be called in the order they are added.
      */
-    void add_pre_middleware(std::function<void(Execution_context&)> func, int priority = 0)
+    void add_pre_middleware(middleware_function func, int priority = 0)
     {
         std::unique_lock lock(M_middlewares);
         pre_middlewares.push_back({ priority, std::move(func) });
@@ -646,6 +678,9 @@ public:
         // Sort by priority (ascending)
         std::stable_sort(pre_middlewares.begin(), pre_middlewares.end(),
             [](const auto& a, const auto& b) { return a.priority < b.priority; });
+        
+        log("Added pre-middleware (priority: " + std::to_string(priority) + ")",
+            Log_level::Debug);
     }
 
     /**
@@ -654,7 +689,9 @@ public:
     void clear_pre_middlewares() noexcept
     {
         std::unique_lock lock(M_middlewares);
+        const size_t count = pre_middlewares.size();
         pre_middlewares.clear();
+        log("Cleared " + std::to_string(count) + " pre-middlewares", Log_level::Debug);
     }
 
     /**
@@ -662,8 +699,11 @@ public:
      * 
      * @param func[in] - Middleware function
      * @param priority[in][opt] - Execution order (lower = earlier). Default: 0.
+     * 
+     * @note If middleware has the same priority, 
+     *   they will be called in the order they are added.
      */
-    void add_post_middleware(std::function<void(Execution_context&)> func, int priority = 0)
+    void add_post_middleware(middleware_function func, int priority = 0)
     {
         std::unique_lock lock(M_middlewares);
         post_middlewares.push_back({ priority, std::move(func) });
@@ -671,6 +711,9 @@ public:
         // Sort by priority (ascending)
         std::stable_sort(post_middlewares.begin(), post_middlewares.end(),
             [](const auto& a, const auto& b) { return a.priority < b.priority; });
+
+        log("Added post-middleware (priority: " + std::to_string(priority) + ")",
+            Log_level::Debug);
     }
 
     /**
@@ -679,7 +722,54 @@ public:
     void clear_post_middlewares() noexcept
     {
         std::unique_lock lock(M_middlewares);
+        const size_t count = post_middlewares.size();
         post_middlewares.clear();
+        log("Cleared " + std::to_string(count) + " post-middlewares", Log_level::Debug);
     }
+
+    // =============================================
+    //  Logging API
+    // =============================================
+
+    /**
+     * @brief Sets custom logger function
+     *
+     * @param func[in] - Logger function to install
+     */
+    void set_logger(log_function func) noexcept
+    {
+        std::unique_lock lock(M_logger);
+        logger = std::move(func);
+    }
+
+    /**
+     * @brief Removes current logger
+     */
+    void remove_logger() noexcept
+    {
+        std::unique_lock lock(M_logger);
+        logger = nullptr;
+    }
+
+    /**
+     * @brief Returns current log level
+     */
+    Log_level get_log_level() const noexcept
+    {
+        return log_level.load(std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Sets log level
+     *
+     * @param level[in] - new Log_level
+     * 
+     * @see flev::Log_level enum class
+     */
+    void set_log_level(Log_level level) noexcept
+    {
+        log_level.store(level, std::memory_order_release);
+    }
+
 };
 } // namespace flev
