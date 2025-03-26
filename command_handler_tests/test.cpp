@@ -1,4 +1,6 @@
-﻿#include "pch.h"
+//#ifdef _MSC_VER uncomment this for other compilers
+#include "pch.h"
+//#endif
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -511,3 +513,13 @@ TEST(CommandHandlerTestMiddleware, MiddlewareCleanup)
 
     ASSERT_FALSE(executed); // Middleware should not execute
 }
+
+#ifndef _MSC_VER
+
+int main(int argc, char** argv)
+{
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}
+
+#endif
