@@ -1,7 +1,8 @@
 #pragma once
+#include <nlohmann/json.hpp>
 #include <unordered_map>
 #include <shared_mutex>
-#include <nlohmann/json.hpp>
+#include <any>
 
 /**
  * @brief Platform-specific calling convention macro.
@@ -13,6 +14,10 @@
 #else
 #   define flev_cdecl 
 #endif
+
+#ifndef FLEV_NODISCARD
+#   define FLEV_NODISCARD [[nodiscard]]
+#endif 
 
 #ifndef GET_FUNC_NAME
   /**
@@ -225,7 +230,6 @@ struct Function_traits<Ret(flev_cdecl C::*)(Args...) const noexcept>
 
 } // namespace detail
 
-using namespace detail;
 
 /**
  * @brief Thread-safe JSON-RPC command handler.
@@ -247,65 +251,46 @@ class Command_handler
 
 public:
 
-    /**
-     * @brief Returns the singleton instance (thread-safe initialization).
-     */
+    /** @brief Returns the singleton instance (thread-safe initialization). */
     static Command_handler& instance() noexcept 
     {
         static Command_handler handler;
         return handler;
     }
 
-private:
     // =============================================
     // Internal types
     // =============================================
 
-    using command_function = std::function<nlohmann::json(const nlohmann::json&)>; 
-    using middleware_function = std::function<void(Execution_context&)>;
-    using log_function = std::function<void(const std::string&, Log_level)>;
-    /**
-     * @brief Internal middleware entry with priority.
-     */
-    struct Middleware_entry 
+    using Middleware_function = std::function<void(Execution_context&)>;
+    using Log_function = std::function<void(const std::string&, Log_level)>;
+
+private:
+    using Command_function = std::function<nlohmann::json(const nlohmann::json&)>;
+    
+    /** @brief Internal middleware entry with priority. */
+    struct Middleware_entry
     {
         int priority;              ///< Execution order (lower = earlier)
-        middleware_function func;  ///< Middleware function
+        Middleware_function func;  ///< Middleware function
     };
 
-    /**
-     * @brief Internal command entry with object lifetime tracking for methods.
-     */
+private:
+
+    /** @brief Internal command entry with object lifetime tracking for methods. */
     struct Command
     {
         std::weak_ptr<void> weak_obj; ///< Weak pointer to bound object (for methods).
-        command_function function;    ///< Wrapped function or method.
+        Command_function function;    ///< Wrapped function or method.
         bool is_method = false;       ///< True if the command is a method.
     };
 
-    // =============================================
-    // Data members
-    // =============================================
-    std::map<std::string, Command> commands; ///< Registered commands
-    mutable std::shared_mutex M_commands;    ///< Mutex for thread safety
-
-    std::vector<Middleware_entry> pre_middlewares; ///< Pre-processing middleware chain
-    std::vector<Middleware_entry> post_middlewares;///< Post-processing middleware chain
-    mutable std::shared_mutex M_middlewares;       ///< Mutex for thread safety 
-
-    Duplicate_policy duplicate_policy = Duplicate_policy::Throw; ///< Current duplicate policy
-
-    log_function logger;                                 ///< User-provided logger
-    mutable std::shared_mutex M_logger;                  ///< Mutex for thread-safe logger access
-    std::atomic<Log_level> log_level = Log_level::Debug;
-
+private:
     // =============================================
     // Command processing internals
     // =============================================
 
-    /**
-     * @brief Internal logging method with level check
-     */
+    /** @brief Internal logging method with level check */
     void log(const std::string& message, Log_level level) const noexcept
     {
         if (level < log_level.load(std::memory_order_acquire))
@@ -333,8 +318,9 @@ private:
      * @details Performs argument count validation and type conversion.
      */
     template <bool Is_method, typename Func, typename Weak_obj>
-    auto make_command_function(Func func, Weak_obj weak_obj)
+    FLEV_NODISCARD auto make_command_function(Func func, Weak_obj weak_obj)
     {
+        using namespace detail;
         return [func, weak_obj](const nlohmann::json& j) -> nlohmann::json
             {
             using Traits = Function_traits<decltype(func)>;
@@ -362,10 +348,12 @@ private:
                     // Check object existence for methods
                     if (auto obj = weak_obj.lock())
                     {
-                        std::apply([&](auto&&... args)
-                            {
+                        std::apply(
+                            [&](auto&&... args) {
                                 std::invoke(func, *obj, args...);
-                            }, args);
+                            }, 
+                            args
+                        );
                     }
                     else
                     {
@@ -384,10 +372,14 @@ private:
                 {
                     if (auto obj = weak_obj.lock())
                     {
-                        return std::apply([&](auto&&... args)
-                            {
-                                return nlohmann::json(std::invoke(func, obj.get(), args...));
-                            }, args);
+                        return std::apply(
+                            [&](auto&&... args) {
+                                return nlohmann::json(
+                                    std::invoke(func, obj.get(), args...)
+                                );
+                            }, 
+                            args
+                        );
                     }
                     else
                     {
@@ -410,25 +402,30 @@ private:
     template <bool Is_method, typename Func, typename Weak_obj>
     void register_command_impl(const std::string& name, Func func, Weak_obj weak_obj)
     {
+        using namespace detail;
         std::unique_lock lock(M_commands);
 
         using Traits = Function_traits<decltype(func)>;
         using Args_tuple = typename Traits::args_tuple;
         using Return_type = typename Traits::return_type;
 
-        static_assert(can_be_serialized<Return_type> || std::is_void_v<Return_type>,
+        static_assert(
+            can_be_serialized<Return_type> || std::is_void_v<Return_type>,
             "Return type must be serializable to JSON. "
-            "For custom types, specialize nlohmann::adl_serializer.");
-        static_assert(all_args_deserializable<Args_tuple>(), 
+            "For custom types, specialize nlohmann::adl_serializer."
+        );
+        static_assert(
+            all_args_deserializable<Args_tuple>(), 
             "All function arguments must be deserializable from nlohmann::json. "
             "Ensure that:\n"
             "1) Argument types are supported by nlohmann::json (e.g., int, std::string).\n"
-            "2) Custom types have `adl_serializer` specialization.\n");
+            "2) Custom types have `adl_serializer` specialization.\n"
+        );
 
         // Handle duplicates according to policy
         if (commands.contains(name))
         {
-            log("Command '" + name + "' already exists", Log_level::Debug);
+            log(std::format("Command '{}' already exists", name), Log_level::Debug);
             switch (duplicate_policy)
             {
             case Duplicate_policy::Replace:
@@ -447,15 +444,22 @@ private:
                 throw std::runtime_error("Invalid duplicate policy");
             }
         }
-        commands[name] = { weak_obj, 
-                           make_command_function<Is_method>(func, weak_obj), 
-                           Is_method 
+        commands[name] = { 
+            weak_obj, 
+            make_command_function<Is_method>(func, weak_obj), 
+            Is_method 
         };
 
-        log("Command '" + name + "' registered successfully. "
-            "Arguments: " + std::to_string(Traits::args_count) + ", "
-            "Return type: " + typeid(Return_type).name(),
-            Log_level::Info);
+        log(
+            std::format(
+                "Command '{}' registered successfully. "
+                "Arguments: {}, Return type: {}",
+                name, 
+                Traits::args_count, 
+                typeid(Return_type).name()
+            ),
+            Log_level::Info
+        );
     }
 
 public:
@@ -471,7 +475,7 @@ public:
      * 
      * @returns True if command exists (thread-safe)
      */
-    bool command_exists(const std::string& name) const noexcept
+    FLEV_NODISCARD bool command_exists(const std::string& name) const noexcept
     {
         std::shared_lock lock(M_commands);
         return commands.contains(name);
@@ -491,7 +495,7 @@ public:
     void register_command(const std::string& name, Func func)
     {
         static_assert(
-            !has_capture<Func>,
+            !detail::has_capture<Func>,
             "Captured lambdas are not allowed. Use stateless lambdas or free functions."
         );
         register_command_impl<false>(name, func, std::weak_ptr<void>{});
@@ -532,7 +536,7 @@ public:
      * 
      * @returns JSON response with status, result, or error message.
      */
-    nlohmann::json execute(const std::string& request_str) const noexcept
+    FLEV_NODISCARD nlohmann::json execute(const std::string& request_str) const noexcept
     {
         Execution_context context; // Stores request/response data and middleware state
         nlohmann::json response;
@@ -563,9 +567,13 @@ public:
             // Execute pre-middleware chain (e.g., auth, logging)
             {
                 std::shared_lock lock(M_middlewares);
-                log("Processing pre-middleware chain (" +
-                    std::to_string(pre_middlewares.size()) + " items)",
-                    Log_level::Debug);
+                log(
+                    std::format(
+                        "Processing pre-middleware chain ({} items)", 
+                        pre_middlewares.size()
+                    ),
+                    Log_level::Debug
+                );
                 for (const auto& middleware : pre_middlewares)
                 {
                     middleware.func(context);  // Pass context to each middleware
@@ -603,9 +611,13 @@ public:
             // Execute post-middleware chain (e.g., add metadata)
             {
                 std::shared_lock lock(M_middlewares);
-                log("Processing post-middleware chain (" +
-                    std::to_string(post_middlewares.size()) + " items)",
-                    Log_level::Debug);
+                log(
+                    std::format(
+                        "Processing post-middleware chain ({} items)",
+                        post_middlewares.size()
+                    ),
+                    Log_level::Debug
+                );
                 for (const auto& middleware : post_middlewares)
                 {
                     middleware.func(context);  // Modify response if needed
@@ -635,6 +647,14 @@ public:
         return context.response;
     }
 
+    /** @brief Returns all registered commands. */
+    FLEV_NODISCARD std::vector<std::string> get_commands_list() const noexcept
+    {
+        std::shared_lock lock(M_commands);
+        const auto& keys = std::views::keys(commands);
+        return std::vector<std::string>(keys.begin(), keys.end());
+    }
+
     // =============================================
     //  Duplicate Policy API
     // =============================================
@@ -650,10 +670,8 @@ public:
         duplicate_policy = new_policy;
     }
 
-    /**
-     * @returns Current duplicate policy.
-     */
-    Duplicate_policy get_duplicate_policy() const noexcept
+    /** @returns Current duplicate policy. */
+    FLEV_NODISCARD Duplicate_policy get_duplicate_policy() const noexcept
     {
         std::shared_lock lock(M_commands);
         return duplicate_policy;
@@ -672,7 +690,7 @@ public:
      * @note If middleware has the same priority, 
      *   they will be called in the order they are added.
      */
-    void add_pre_middleware(middleware_function func, int priority = 0)
+    void add_pre_middleware(Middleware_function func, int priority = 0)
     {
         std::unique_lock lock(M_middlewares);
         pre_middlewares.push_back({ priority, std::move(func) });
@@ -681,19 +699,19 @@ public:
         std::stable_sort(pre_middlewares.begin(), pre_middlewares.end(),
             [](const auto& a, const auto& b) { return a.priority < b.priority; });
         
-        log("Added pre-middleware (priority: " + std::to_string(priority) + ")",
-            Log_level::Debug);
+        log(
+            std::format("Added pre-middleware (priority: {})", priority),
+            Log_level::Debug
+        );
     }
 
-    /**
-     * @brief Clears all registered pre-middlewares.
-     */
+    /** @brief Clears all registered pre-middlewares. */
     void clear_pre_middlewares() noexcept
     {
         std::unique_lock lock(M_middlewares);
         const size_t count = pre_middlewares.size();
         pre_middlewares.clear();
-        log("Cleared " + std::to_string(count) + " pre-middlewares", Log_level::Debug);
+        log(std::format("Cleared {} pre-middlewares", count), Log_level::Debug);
     }
 
     /**
@@ -705,28 +723,31 @@ public:
      * @note If middleware has the same priority, 
      *   they will be called in the order they are added.
      */
-    void add_post_middleware(middleware_function func, int priority = 0)
+    void add_post_middleware(Middleware_function func, int priority = 0)
     {
         std::unique_lock lock(M_middlewares);
         post_middlewares.push_back({ priority, std::move(func) });
 
         // Sort by priority (ascending)
-        std::stable_sort(post_middlewares.begin(), post_middlewares.end(),
-            [](const auto& a, const auto& b) { return a.priority < b.priority; });
+        std::stable_sort(
+            post_middlewares.begin(), 
+            post_middlewares.end(),
+            [](const auto& a, const auto& b) { return a.priority < b.priority; }
+        );
 
-        log("Added post-middleware (priority: " + std::to_string(priority) + ")",
-            Log_level::Debug);
+        log(
+            std::format("Added post-middleware (priority: {})", priority),
+            Log_level::Debug
+        );
     }
 
-    /**
-     * @brief Clears all registered post-middlewares.
-     */
+    /** @brief Clears all registered post-middlewares. */
     void clear_post_middlewares() noexcept
     {
         std::unique_lock lock(M_middlewares);
         const size_t count = post_middlewares.size();
         post_middlewares.clear();
-        log("Cleared " + std::to_string(count) + " post-middlewares", Log_level::Debug);
+        log(std::format("Cleared {} post-middlewares", count), Log_level::Debug);
     }
 
     // =============================================
@@ -738,25 +759,21 @@ public:
      *
      * @param func[in] - Logger function to install
      */
-    void set_logger(log_function func) noexcept
+    void set_logger(Log_function func) noexcept
     {
         std::unique_lock lock(M_logger);
         logger = std::move(func);
     }
 
-    /**
-     * @brief Removes current logger
-     */
+    /** @brief Removes current logger */
     void remove_logger() noexcept
     {
         std::unique_lock lock(M_logger);
         logger = nullptr;
     }
 
-    /**
-     * @brief Returns current log level
-     */
-    Log_level get_log_level() const noexcept
+    /** @brief Returns current log level */
+    FLEV_NODISCARD Log_level get_log_level() const noexcept
     {
         return log_level.load(std::memory_order_relaxed);
     }
@@ -767,11 +784,29 @@ public:
      * @param level[in] - new Log_level
      * 
      * @see flev::Log_level enum class
+     * @note Default log level is Debug (All messages)
      */
     void set_log_level(Log_level level) noexcept
     {
         log_level.store(level, std::memory_order_release);
     }
 
+
+    // =============================================
+    // Data members
+    // =============================================
+private:
+    std::map<std::string, Command> commands; ///< Registered commands
+    mutable std::shared_mutex M_commands;    ///< Mutex for thread safety
+
+    std::vector<Middleware_entry> pre_middlewares; ///< Pre-processing middleware chain
+    std::vector<Middleware_entry> post_middlewares;///< Post-processing middleware chain
+    mutable std::shared_mutex M_middlewares;       ///< Mutex for thread safety 
+
+    Duplicate_policy duplicate_policy = Duplicate_policy::Throw; ///< Current duplicate policy
+
+    Log_function logger;                ///< User-provided logger
+    mutable std::shared_mutex M_logger; ///< Mutex for thread-safe logger access
+    std::atomic<Log_level> log_level = Log_level::Debug;
 };
 } // namespace flev
